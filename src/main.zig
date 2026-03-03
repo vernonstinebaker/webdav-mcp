@@ -184,7 +184,10 @@ fn hostnameFromUrl(url: []const u8) []const u8 {
     const scheme_end = std.mem.indexOf(u8, url, "://") orelse return url;
     const host_start = scheme_end + 3;
     const host_end = std.mem.indexOfScalarPos(u8, url, host_start, '/') orelse url.len;
-    return url[host_start..host_end];
+    const host_with_port = url[host_start..host_end];
+    // Strip port: netrc 'machine' field does not support host:port format
+    const colon = std.mem.indexOfScalar(u8, host_with_port, ':') orelse return host_with_port;
+    return host_with_port[0..colon];
 }
 
 fn curlRequest(
@@ -1327,7 +1330,7 @@ test "curlRequest argv includes timeout flags" {
 }
 
 test "hostnameFromUrl" {
-    try std.testing.expectEqualStrings("host:8080", hostnameFromUrl("http://host:8080/path"));
+    try std.testing.expectEqualStrings("host", hostnameFromUrl("http://host:8080/path"));
     try std.testing.expectEqualStrings("example.com", hostnameFromUrl("https://example.com/dav/"));
     try std.testing.expectEqualStrings("host", hostnameFromUrl("http://host"));
 }
