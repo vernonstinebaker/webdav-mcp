@@ -43,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "linux-arm64", .triple = "aarch64-linux-musl" },
         .{ .name = "linux-x86_64", .triple = "x86_64-linux-musl" },
         .{ .name = "linux-armv7", .triple = "arm-linux-musleabihf" },
+        .{ .name = "linux-riscv64", .triple = "riscv64-linux-musl" },
         .{ .name = "windows-x86_64", .triple = "x86_64-windows-gnu" },
     };
 
