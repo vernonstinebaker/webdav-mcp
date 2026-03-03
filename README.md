@@ -115,3 +115,5 @@ All unit tests cover XML parsing, JSON-RPC dispatch, argument extraction, URL co
 
 MIT — see [LICENSE](LICENSE).
 
+<!-- mcp-name: io.github.vernonstinebaker/webdav-mcp -->
+
