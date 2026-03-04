@@ -1,2 +1,7 @@
 zig-out/
 .zig-cache/
+
+# Local config / credentials
+server.json
+*.env
+.env*
