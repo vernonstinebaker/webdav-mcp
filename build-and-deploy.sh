@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 
 echo "=== Building native ($(uname -m)) ==="
 zig build -Doptimize=ReleaseSmall
+rm -f ~/bin/webdav-mcp
 cp zig-out/bin/webdav-mcp ~/bin/webdav-mcp
 echo "    Installed: ~/bin/webdav-mcp ($(du -h ~/bin/webdav-mcp | cut -f1))"
 
