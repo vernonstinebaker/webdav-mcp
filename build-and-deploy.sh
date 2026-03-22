@@ -16,6 +16,7 @@ cp zig-out/bin/webdav-mcp zig-out/bin/webdav-mcp-riscv64
 
 echo ""
 echo "=== Deploying to orangepi:~/bin/ ==="
+ssh orangepi "rm -f ~/bin/webdav-mcp"
 scp zig-out/bin/webdav-mcp-riscv64 orangepi:~/bin/webdav-mcp
 echo "    Deployed."
 
