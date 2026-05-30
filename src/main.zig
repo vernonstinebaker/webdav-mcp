@@ -2,7 +2,7 @@
 //!
 //! Speaks JSON-RPC 2.0 over stdio (newline-delimited).
 //! Provides tools: list, read, write, delete, mkdir, move, copy.
-//! Uses curl for HTTP transport (supports all WebDAV methods).
+//! Uses native Zig networking for HTTP/WebDAV transport.
 //! Configured via environment variables:
 //!   WEBDAV_URL  — base URL (e.g. http://100.110.80.108:8080)
 //!   WEBDAV_USER — HTTP Basic Auth username (optional)
@@ -19,14 +19,12 @@ const Config = struct {
     pass: ?[]const u8, // password or null
 };
 
-fn loadConfig(allocator: Allocator) !Config {
-    const url = std.process.getEnvVarOwned(allocator, "WEBDAV_URL") catch
-        return error.MissingWebdavUrl;
+fn loadConfig(allocator: Allocator, environ_map: *const std.process.Environ.Map) !Config {
+    const url = environ_map.get("WEBDAV_URL") orelse return error.MissingWebdavUrl;
+    const user = if (environ_map.get("WEBDAV_USER")) |value| try allocator.dupe(u8, value) else null;
+    const pass = if (environ_map.get("WEBDAV_PASS")) |value| try allocator.dupe(u8, value) else null;
 
-    const user = std.process.getEnvVarOwned(allocator, "WEBDAV_USER") catch null;
-    const pass = std.process.getEnvVarOwned(allocator, "WEBDAV_PASS") catch null;
-
-    return .{ .base_url = url, .user = user, .pass = pass };
+    return .{ .base_url = try allocator.dupe(u8, url), .user = user, .pass = pass };
 }
 
 // ── JSON-RPC 2.0 I/O ───────────────────────────────────────────
@@ -37,17 +35,18 @@ const JsonRpcRequest = struct {
     params: ?std.json.Value = null,
 };
 
-fn readRequest(allocator: Allocator, file: std.fs.File) !?JsonRpcRequest {
+fn readRequest(allocator: Allocator, reader: *std.Io.Reader) !?JsonRpcRequest {
     var line_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer line_buf.deinit(allocator);
 
-    var byte: [1]u8 = undefined;
     while (true) {
-        const n = file.read(&byte) catch return null;
-        if (n == 0) return null;
-        if (byte[0] == '\n') break;
-        if (byte[0] != '\r') {
-            try line_buf.append(allocator, byte[0]);
+        const byte = reader.takeByte() catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => return err,
+        };
+        if (byte == '\n') break;
+        if (byte != '\r') {
+            try line_buf.append(allocator, byte);
         }
     }
 
@@ -91,7 +90,7 @@ fn writeId(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, id: ?std.json
     }
 }
 
-fn writeResponse(file: std.fs.File, id: ?std.json.Value, result_json: []const u8) !void {
+fn writeResponse(writer: *std.Io.Writer, id: ?std.json.Value, result_json: []const u8) !void {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(std.heap.page_allocator);
     const a = std.heap.page_allocator;
@@ -100,10 +99,11 @@ fn writeResponse(file: std.fs.File, id: ?std.json.Value, result_json: []const u8
     try buf.appendSlice(a, ",\"result\":");
     try buf.appendSlice(a, result_json);
     try buf.appendSlice(a, "}\n");
-    try file.writeAll(buf.items);
+    try writer.writeAll(buf.items);
+    try writer.flush();
 }
 
-fn writeError(file: std.fs.File, id: ?std.json.Value, code: i32, message: []const u8) !void {
+fn writeError(writer: *std.Io.Writer, id: ?std.json.Value, code: i32, message: []const u8) !void {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(std.heap.page_allocator);
     const a = std.heap.page_allocator;
@@ -116,10 +116,11 @@ fn writeError(file: std.fs.File, id: ?std.json.Value, code: i32, message: []cons
     try buf.appendSlice(a, ",\"message\":\"");
     try appendJsonEscaped(&buf, a, message);
     try buf.appendSlice(a, "\"}}\n");
-    try file.writeAll(buf.items);
+    try writer.writeAll(buf.items);
+    try writer.flush();
 }
 
-fn writeToolResult(file: std.fs.File, id: ?std.json.Value, text: []const u8, is_error: bool) !void {
+fn writeToolResult(writer: *std.Io.Writer, id: ?std.json.Value, text: []const u8, is_error: bool) !void {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(std.heap.page_allocator);
     const a = std.heap.page_allocator;
@@ -130,7 +131,8 @@ fn writeToolResult(file: std.fs.File, id: ?std.json.Value, text: []const u8, is_
     try buf.appendSlice(a, "\"}],\"isError\":");
     try buf.appendSlice(a, if (is_error) "true" else "false");
     try buf.appendSlice(a, "}}\n");
-    try file.writeAll(buf.items);
+    try writer.writeAll(buf.items);
+    try writer.flush();
 }
 
 // (writeJsonEscaped removed — using appendJsonEscaped with buffer instead)
@@ -170,153 +172,254 @@ const tools_json =
     "{\"name\":\"stat\",\"description\":\"Get metadata for a single file or directory on WebDAV (PROPFIND Depth:0). Returns type (file/dir/missing), size, last-modified, ETag, and content-type. Use this to check existence or get file info without listing a whole directory.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to stat relative to WebDAV root\"}},\"required\":[\"path\"]}}" ++
     "]}";
 
-// ── curl-based HTTP transport ───────────────────────────────────
+// ── native HTTP/WebDAV transport ────────────────────────────────
 
-const CurlResult = struct {
+const HttpResult = struct {
     status: u16,
     body: []const u8,
+};
+
+const ParsedBaseUrl = struct {
+    uri: std.Uri,
+    host: std.Io.net.HostName,
+    protocol: std.http.Client.Protocol,
+    port: u16,
+    base_path: []const u8,
 };
 
 /// Extract the hostname (and port if present) from a URL.
 /// e.g. "https://example.com/dav/" -> "example.com"
 ///      "http://host:8080/path"    -> "host:8080"
-fn hostnameFromUrl(url: []const u8) []const u8 {
-    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return url;
-    const host_start = scheme_end + 3;
-    const host_end = std.mem.indexOfScalarPos(u8, url, host_start, '/') orelse url.len;
-    const host_with_port = url[host_start..host_end];
-    // Strip port: netrc 'machine' field does not support host:port format
-    const colon = std.mem.indexOfScalar(u8, host_with_port, ':') orelse return host_with_port;
-    return host_with_port[0..colon];
+fn parseBaseUrl(allocator: Allocator, base_url: []const u8) !ParsedBaseUrl {
+    const uri = try std.Uri.parse(base_url);
+    const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedUriScheme;
+    const port: u16 = uri.port orelse switch (protocol) {
+        .plain => @as(u16, 80),
+        .tls => @as(u16, 443),
+    };
+
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = try uri.getHost(&host_buf);
+
+    const base_path = if (uri.path.isEmpty())
+        "/"
+    else
+        try allocator.dupe(u8, uri.path.percent_encoded);
+
+    return .{
+        .uri = uri,
+        .host = host,
+        .protocol = protocol,
+        .port = port,
+        .base_path = base_path,
+    };
 }
 
-fn curlRequest(
+fn buildRequestPath(allocator: Allocator, parsed: ParsedBaseUrl, path: []const u8) ![]u8 {
+    const encoded_path = try percentEncodePath(allocator, path);
+    defer allocator.free(encoded_path);
+
+    const base_path = if (std.mem.eql(u8, parsed.base_path, "/")) "" else parsed.base_path;
+
+    if (encoded_path.len == 0) {
+        return allocator.dupe(u8, if (base_path.len == 0) "/" else base_path);
+    }
+    if (encoded_path[0] == '/') {
+        if (base_path.len == 0) return allocator.dupe(u8, encoded_path);
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ base_path, encoded_path });
+    }
+    if (base_path.len == 0) return std.fmt.allocPrint(allocator, "/{s}", .{encoded_path});
+    if (std.mem.endsWith(u8, base_path, "/")) {
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ base_path, encoded_path });
+    }
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_path, encoded_path });
+}
+
+fn buildBasicAuthHeader(allocator: Allocator, user: []const u8, pass: []const u8) ![]u8 {
+    const credentials = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ user, pass });
+    defer allocator.free(credentials);
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(credentials.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    _ = std.base64.standard.Encoder.encode(encoded, credentials);
+
+    const header = try std.fmt.allocPrint(allocator, "Basic {s}", .{encoded});
+    allocator.free(encoded);
+    return header;
+}
+
+fn buildHostHeader(allocator: Allocator, parsed: ParsedBaseUrl) ![]u8 {
+    const host = parsed.uri.host orelse return error.UriMissingHost;
+    const host_only = try std.fmt.allocPrint(allocator, "{f}", .{std.fmt.alt(host, .formatHost)});
+    errdefer allocator.free(host_only);
+
+    const default_port: u16 = switch (parsed.protocol) {
+        .plain => 80,
+        .tls => 443,
+    };
+    if (parsed.port == default_port and parsed.uri.port == null) return host_only;
+
+    const with_port = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ host_only, parsed.port });
+    allocator.free(host_only);
+    return with_port;
+}
+
+fn readHttpHead(reader: *std.Io.Reader, allocator: Allocator) ![]u8 {
+    var head_buf = std.ArrayList(u8).empty;
+    defer head_buf.deinit(allocator);
+
+    var line_buf = std.ArrayList(u8).empty;
+    defer line_buf.deinit(allocator);
+
+    while (true) {
+        line_buf.clearRetainingCapacity();
+        while (true) {
+            const byte = try reader.takeByte();
+            try line_buf.append(allocator, byte);
+            if (byte == '\n') break;
+        }
+        try head_buf.appendSlice(allocator, line_buf.items);
+        if (std.mem.endsWith(u8, head_buf.items, "\r\n\r\n") or std.mem.endsWith(u8, head_buf.items, "\n\n")) {
+            return head_buf.toOwnedSlice(allocator);
+        }
+    }
+}
+
+fn readLineAlloc(reader: *std.Io.Reader, allocator: Allocator) ![]u8 {
+    var line = std.ArrayList(u8).empty;
+    errdefer line.deinit(allocator);
+
+    while (true) {
+        const byte = try reader.takeByte();
+        try line.append(allocator, byte);
+        if (byte == '\n') return line.toOwnedSlice(allocator);
+    }
+}
+
+fn parseChunkLength(line: []const u8) !u64 {
+    const trimmed = std.mem.trim(u8, line, "\r\n ");
+    var parts = std.mem.splitScalar(u8, trimmed, ';');
+    const size_field = parts.first();
+    if (size_field.len == 0) return error.HttpHeadersInvalid;
+    return std.fmt.parseInt(u64, size_field, 16) catch error.HttpHeadersInvalid;
+}
+
+fn readChunkedBody(reader: *std.Io.Reader, allocator: Allocator) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    while (true) {
+        const line = try readLineAlloc(reader, allocator);
+        defer allocator.free(line);
+        const chunk_len = try parseChunkLength(line);
+        if (chunk_len == 0) {
+            // consume trailing CRLF after zero chunk and optional trailers until blank line
+            while (true) {
+                const trailer = try readLineAlloc(reader, allocator);
+                defer allocator.free(trailer);
+                const trimmed = std.mem.trim(u8, trailer, "\r\n");
+                if (trimmed.len == 0) break;
+            }
+            return out.toOwnedSlice(allocator);
+        }
+        const chunk_len_usize: usize = @intCast(chunk_len);
+        try out.ensureUnusedCapacity(allocator, chunk_len_usize);
+        const start = out.items.len;
+        out.items.len += chunk_len_usize;
+        try reader.readSliceAll(out.items[start .. start + chunk_len_usize]);
+        try reader.discardAll(2); // CRLF after chunk data
+    }
+}
+
+fn readHttpBody(
+    reader: *std.Io.Reader,
+    allocator: Allocator,
+    head: std.http.Client.Response.Head,
+) ![]u8 {
+    if (head.transfer_encoding == .chunked) {
+        return readChunkedBody(reader, allocator);
+    }
+    if (head.content_length) |len| {
+        const exact_len: usize = @intCast(len);
+        const buf = try allocator.alloc(u8, exact_len);
+        errdefer allocator.free(buf);
+        try reader.readSliceAll(buf);
+        return buf;
+    }
+    return reader.allocRemaining(allocator, .limited(1024 * 1024));
+}
+
+fn httpRequest(
     allocator: Allocator,
     config: Config,
     method: []const u8,
     path: []const u8,
     body: ?[]const u8,
     extra_headers: []const [2][]const u8,
-) !CurlResult {
-    const url = try buildUrl(allocator, config.base_url, path);
-    defer allocator.free(url);
+) !HttpResult {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    var client: std.http.Client = .{ .allocator = allocator, .io = threaded.io() };
+    defer client.deinit();
 
-    // Build argv
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer argv.deinit(allocator);
+    const parsed = try parseBaseUrl(allocator, config.base_url);
+    defer if (!std.mem.eql(u8, parsed.base_path, "/")) allocator.free(parsed.base_path);
 
-    try argv.append(allocator, "curl");
-    try argv.append(allocator, "-s"); // silent
-    try argv.append(allocator, "-S"); // show errors
-    try argv.append(allocator, "--max-time");
-    try argv.append(allocator, "30");
-    try argv.append(allocator, "--connect-timeout");
-    try argv.append(allocator, "10");
-    try argv.append(allocator, "-w"); // write status code after body
-    try argv.append(allocator, "\n%{http_code}");
-    try argv.append(allocator, "-X");
-    try argv.append(allocator, method);
+    const request_path = try buildRequestPath(allocator, parsed, path);
+    defer allocator.free(request_path);
 
-    // Auth via temp netrc file to avoid credentials appearing in process argv.
-    var netrc_path: ?[]const u8 = null;
-    defer if (netrc_path) |p| {
-        std.fs.deleteFileAbsolute(p) catch {};
-        allocator.free(p);
-    };
+    const host_header = try buildHostHeader(allocator, parsed);
+    defer allocator.free(host_header);
+
+    const connection = try client.connect(parsed.host, parsed.port, parsed.protocol);
+    errdefer client.connection_pool.release(connection, threaded.io());
+
+    var writer_buf = std.Io.Writer.Allocating.init(allocator);
+    defer writer_buf.deinit();
+    const writer = &writer_buf.writer;
+
+    try writer.print("{s} {s} HTTP/1.1\r\n", .{ method, request_path });
+    try writer.print("Host: {s}\r\n", .{host_header});
+    try writer.writeAll("Connection: close\r\n");
+    try writer.writeAll("User-Agent: webdav-mcp/1.1.0\r\n");
+    try writer.writeAll("Accept: */*\r\n");
+
     if (config.user) |user| {
         const pass = config.pass orelse "";
-        const host = hostnameFromUrl(config.base_url);
-        const netrc_content = try std.fmt.allocPrint(
-            allocator,
-            "machine {s} login {s} password {s}\n",
-            .{ host, user, pass },
-        );
-        defer allocator.free(netrc_content);
-        // Write to a temp file under /tmp
-        const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/.webdav-mcp-netrc-{d}", .{std.crypto.random.int(u32)});
-        const tmp_file = std.fs.createFileAbsolute(tmp_path, .{ .mode = 0o600 }) catch {
-            allocator.free(tmp_path);
-            return error.CurlFailed;
-        };
-        tmp_file.writeAll(netrc_content) catch {
-            tmp_file.close();
-            std.fs.deleteFileAbsolute(tmp_path) catch {};
-            allocator.free(tmp_path);
-            return error.CurlFailed;
-        };
-        tmp_file.close();
-        netrc_path = tmp_path;
-        try argv.append(allocator, "--netrc-file");
-        try argv.append(allocator, tmp_path);
+        const auth = try buildBasicAuthHeader(allocator, user, pass);
+        defer allocator.free(auth);
+        try writer.print("Authorization: {s}\r\n", .{auth});
     }
 
-    // Extra headers
     for (extra_headers) |hdr| {
-        try argv.append(allocator, "-H");
-        const header_line = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ hdr[0], hdr[1] });
-        try argv.append(allocator, header_line);
+        try writer.print("{s}: {s}\r\n", .{ hdr[0], hdr[1] });
     }
 
-    // Body via stdin if present
-    if (body != null) {
-        try argv.append(allocator, "--data-binary");
-        try argv.append(allocator, "@-");
+    if (body) |payload| {
+        try writer.print("Content-Length: {d}\r\n", .{payload.len});
     }
 
-    try argv.append(allocator, url);
+    try writer.writeAll("\r\n");
+    if (body) |payload| try writer.writeAll(payload);
 
-    // Spawn curl
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    try connection.writer().writeAll(writer_buf.written());
+    try connection.flush();
 
-    try child.spawn();
+    var read_buf: [8192]u8 = undefined;
+    var reader = connection.reader();
+    reader.buffer = &read_buf;
+    reader.seek = 0;
+    reader.end = 0;
 
-    // Write body to stdin if present
-    if (body) |b| {
-        if (child.stdin) |stdin_file| {
-            stdin_file.writeAll(b) catch {};
-            stdin_file.close();
-            child.stdin = null;
-        }
-    } else {
-        if (child.stdin) |stdin_file| {
-            stdin_file.close();
-            child.stdin = null;
-        }
-    }
+    const head_bytes = try readHttpHead(reader, allocator);
+    defer allocator.free(head_bytes);
 
-    // Read stdout
-    const stdout_data = if (child.stdout) |stdout_file|
-        stdout_file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return error.CurlFailed
-    else
-        return error.CurlFailed;
+    const head = try std.http.Client.Response.Head.parse(head_bytes);
+    const response_body = try readHttpBody(reader, allocator, head);
 
-    const term = child.wait() catch return error.CurlFailed;
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            allocator.free(stdout_data);
-            return error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout_data);
-            return error.CurlFailed;
-        },
-    }
+    connection.closing = true;
+    client.connection_pool.release(connection, threaded.io());
 
-    // Parse: body is everything before the last line, status is the last line
-    // curl -w "\n%{http_code}" appends \n<code> at the end
-    if (std.mem.lastIndexOfScalar(u8, stdout_data, '\n')) |last_nl| {
-        const status_str = stdout_data[last_nl + 1 ..];
-        const status = std.fmt.parseInt(u16, status_str, 10) catch 0;
-        const resp_body = try allocator.dupe(u8, stdout_data[0..last_nl]);
-        allocator.free(stdout_data);
-        return .{ .status = status, .body = resp_body };
-    }
-
-    // No newline found — treat entire output as body with unknown status
-    return .{ .status = 0, .body = stdout_data };
+    return .{ .status = @intFromEnum(head.status), .body = response_body };
 }
 
 /// Percent-encode a path string, preserving '/' separators.
@@ -402,7 +505,7 @@ fn handleList(allocator: Allocator, config: Config, params: ?std.json.Value) ![]
         .{ "Content-Type", "application/xml" },
     };
 
-    const result = curlRequest(allocator, config, "PROPFIND", path, propfind_body, &headers) catch |err| {
+    const result = httpRequest(allocator, config, "PROPFIND", path, propfind_body, &headers) catch |err| {
         return std.fmt.allocPrint(allocator, "Error: WebDAV PROPFIND failed: {}", .{err});
     };
     defer allocator.free(result.body);
@@ -427,7 +530,7 @@ fn checkFileSize(allocator: Allocator, config: Config, path: []const u8) !usize 
         .{ "Depth", "0" },
         .{ "Content-Type", "application/xml" },
     };
-    const result = try curlRequest(allocator, config, "PROPFIND", path, propfind_body, &headers);
+    const result = try httpRequest(allocator, config, "PROPFIND", path, propfind_body, &headers);
     defer allocator.free(result.body);
     if (result.status != 207 and !(result.status >= 200 and result.status < 300)) return 0;
     const size_str = extractTagContent(result.body, "getcontentlength") orelse return 0;
@@ -449,7 +552,7 @@ fn handleRead(allocator: Allocator, config: Config, params: ?std.json.Value) ![]
         );
     }
 
-    const result = curlRequest(allocator, config, "GET", path, null, &.{}) catch |err| {
+    const result = httpRequest(allocator, config, "GET", path, null, &.{}) catch |err| {
         return std.fmt.allocPrint(allocator, "Error: WebDAV GET failed: {}", .{err});
     };
 
@@ -473,7 +576,7 @@ fn mkdirAll(allocator: Allocator, config: Config, path: []const u8) !void {
         try prefix.appendSlice(allocator, segment);
         const current = try allocator.dupe(u8, prefix.items);
         defer allocator.free(current);
-        const r = curlRequest(allocator, config, "MKCOL", current, null, &.{}) catch continue;
+        const r = httpRequest(allocator, config, "MKCOL", current, null, &.{}) catch continue;
         allocator.free(r.body);
         // 201 = created, 405 = already exists — both are fine
         if (r.status != 201 and r.status != 405 and !(r.status >= 200 and r.status < 300)) {
@@ -494,7 +597,7 @@ fn handleWrite(allocator: Allocator, config: Config, params: ?std.json.Value) ![
         .{ "Content-Type", content_type },
     };
 
-    const result = curlRequest(allocator, config, "PUT", path, content, &headers) catch |err| {
+    const result = httpRequest(allocator, config, "PUT", path, content, &headers) catch |err| {
         return std.fmt.allocPrint(allocator, "Error: WebDAV PUT failed: {}", .{err});
     };
 
@@ -508,7 +611,7 @@ fn handleWrite(allocator: Allocator, config: Config, params: ?std.json.Value) ![
                 return try allocator.dupe(u8, "Error: failed to create parent directories");
             };
             // Retry the PUT
-            const retry = curlRequest(allocator, config, "PUT", path, content, &headers) catch |err| {
+            const retry = httpRequest(allocator, config, "PUT", path, content, &headers) catch |err| {
                 return std.fmt.allocPrint(allocator, "Error: WebDAV PUT failed on retry: {}", .{err});
             };
             defer allocator.free(retry.body);
@@ -534,7 +637,7 @@ fn handleDelete(allocator: Allocator, config: Config, params: ?std.json.Value) !
     const path = getStringParam(params, "path") orelse
         return try allocator.dupe(u8, "Error: 'path' parameter is required");
 
-    const result = curlRequest(allocator, config, "DELETE", path, null, &.{}) catch |err| {
+    const result = httpRequest(allocator, config, "DELETE", path, null, &.{}) catch |err| {
         return std.fmt.allocPrint(allocator, "Error: WebDAV DELETE failed: {}", .{err});
     };
     defer allocator.free(result.body);
@@ -550,7 +653,7 @@ fn handleMkdir(allocator: Allocator, config: Config, params: ?std.json.Value) ![
     const path = getStringParam(params, "path") orelse
         return try allocator.dupe(u8, "Error: 'path' parameter is required");
 
-    const result = curlRequest(allocator, config, "MKCOL", path, null, &.{}) catch |err| {
+    const result = httpRequest(allocator, config, "MKCOL", path, null, &.{}) catch |err| {
         return std.fmt.allocPrint(allocator, "Error: WebDAV MKCOL failed: {}", .{err});
     };
     defer allocator.free(result.body);
@@ -589,7 +692,7 @@ fn handleStat(allocator: Allocator, config: Config, params: ?std.json.Value) ![]
         .{ "Content-Type", "application/xml" },
     };
 
-    const result = curlRequest(allocator, config, "PROPFIND", path, propfind_body, &headers) catch |err| {
+    const result = httpRequest(allocator, config, "PROPFIND", path, propfind_body, &headers) catch |err| {
         return std.fmt.allocPrint(allocator, "Error: WebDAV PROPFIND failed: {}", .{err});
     };
     defer allocator.free(result.body);
@@ -672,7 +775,7 @@ fn handleMoveOrCopy(allocator: Allocator, config: Config, params: ?std.json.Valu
         try hdr_list.append(allocator, .{ "Depth", "infinity" });
     }
 
-    const result = curlRequest(allocator, config, method, source, null, hdr_list.items) catch |err| {
+    const result = httpRequest(allocator, config, method, source, null, hdr_list.items) catch |err| {
         return std.fmt.allocPrint(allocator, "Error: WebDAV {s} failed: {}", .{ method, err });
     };
     defer allocator.free(result.body);
@@ -704,8 +807,8 @@ fn parseMultistatusListing(allocator: Allocator, xml: []const u8, requested_path
 
         // Skip the self-entry: the <href> of the requested collection itself.
         // Normalize by stripping trailing slashes before comparing.
-        const href_trimmed = std.mem.trimRight(u8, href, "/");
-        const req_trimmed = std.mem.trimRight(u8, requested_path, "/");
+        const href_trimmed = std.mem.trimEnd(u8, href, "/");
+        const req_trimmed = std.mem.trimEnd(u8, requested_path, "/");
         if (std.mem.eql(u8, href_trimmed, req_trimmed)) {
             pos = resp_end;
             continue;
@@ -911,21 +1014,29 @@ fn getToolArguments(params: ?std.json.Value) ?std.json.Value {
 
 // ── Main loop ───────────────────────────────────────────────────
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = std.heap.smp_allocator;
+    const io = init.io;
 
-    const config = loadConfig(allocator) catch {
-        std.fs.File.stderr().writeAll("Error: WEBDAV_URL environment variable is required\n") catch {};
+    var stderr_buffer: [256]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+
+    const config = loadConfig(allocator, init.environ_map) catch {
+        try stderr.writeAll("Error: WEBDAV_URL environment variable is required\n");
+        try stderr.flush();
         std.process.exit(1);
     };
 
-    const stdin_file = std.fs.File.stdin();
-    const stdout_file = std.fs.File.stdout();
+    var stdin_buffer: [4096]u8 = undefined;
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const stdin = &stdin_reader.interface;
+    const stdout = &stdout_writer.interface;
 
     while (true) {
-        const req = readRequest(allocator, stdin_file) catch break;
+        const req = readRequest(allocator, stdin) catch break;
         if (req == null) break;
 
         const request = req.?;
@@ -934,7 +1045,7 @@ pub fn main() !void {
             const init_result =
                 \\{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"webdav-mcp","version":"1.1.0"}}
             ;
-            writeResponse(stdout_file, request.id, init_result) catch break;
+            writeResponse(stdout, request.id, init_result) catch break;
             continue;
         }
 
@@ -943,36 +1054,36 @@ pub fn main() !void {
         }
 
         if (std.mem.eql(u8, request.method, "tools/list")) {
-            writeResponse(stdout_file, request.id, tools_json) catch break;
+            writeResponse(stdout, request.id, tools_json) catch break;
             continue;
         }
 
         if (std.mem.eql(u8, request.method, "tools/call")) {
-            handleToolCall(allocator, config, request, stdout_file) catch break;
+            handleToolCall(allocator, config, request, stdout) catch break;
             continue;
         }
 
-        writeError(stdout_file, request.id, -32601, "Method not found") catch break;
+        writeError(stdout, request.id, -32601, "Method not found") catch break;
     }
 }
 
-fn handleToolCall(allocator: Allocator, config: Config, request: JsonRpcRequest, file: std.fs.File) !void {
+fn handleToolCall(allocator: Allocator, config: Config, request: JsonRpcRequest, writer: *std.Io.Writer) !void {
     const params = request.params;
     const tool_name = getToolName(params) orelse {
-        try writeError(file, request.id, -32602, "Missing tool name");
+        try writeError(writer, request.id, -32602, "Missing tool name");
         return;
     };
 
     const tool_params = getToolArguments(params);
 
     const output = dispatchTool(allocator, config, tool_name, tool_params) catch {
-        try writeToolResult(file, request.id, "Internal error executing tool", true);
+        try writeToolResult(writer, request.id, "Internal error executing tool", true);
         return;
     };
     defer allocator.free(output);
 
     const is_error = std.mem.startsWith(u8, output, "Error:");
-    try writeToolResult(file, request.id, output, is_error);
+    try writeToolResult(writer, request.id, output, is_error);
 }
 
 fn dispatchTool(allocator: Allocator, config: Config, name: []const u8, params: ?std.json.Value) ![]const u8 {
@@ -1321,18 +1432,10 @@ test "handleMoveOrCopy accepts 207 as success" {
     try std.testing.expect(status >= 200 and status < 300);
 }
 
-test "curlRequest argv includes timeout flags" {
-    // Verify the timeout constants are sane values (compile-time check).
-    const max_time: u32 = 30;
-    const connect_timeout: u32 = 10;
-    try std.testing.expect(max_time > connect_timeout);
-    try std.testing.expect(connect_timeout > 0);
-}
-
-test "hostnameFromUrl" {
-    try std.testing.expectEqualStrings("host", hostnameFromUrl("http://host:8080/path"));
-    try std.testing.expectEqualStrings("example.com", hostnameFromUrl("https://example.com/dav/"));
-    try std.testing.expectEqualStrings("host", hostnameFromUrl("http://host"));
+test "buildBasicAuthHeader prefixes Basic" {
+    const header = try buildBasicAuthHeader(std.testing.allocator, "bot", "bot");
+    defer std.testing.allocator.free(header);
+    try std.testing.expect(std.mem.startsWith(u8, header, "Basic "));
 }
 
 test "percentEncodePath plain path unchanged" {

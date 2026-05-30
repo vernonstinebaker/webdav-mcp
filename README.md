@@ -53,11 +53,11 @@ Set these environment variables before launching the server:
 
 ### Credential security
 
-Credentials are passed to `curl` via a temporary netrc file written to `/tmp` with mode `0600`, not via command-line arguments. This prevents the username and password from appearing in process listings (`ps -ef`, `/proc/<pid>/cmdline`). The temp file is deleted immediately after the curl subprocess exits.
+Credentials are sent via native Zig HTTP networking using the `Authorization: Basic ...` header. No external `curl` process is spawned.
 
 ## Building from source
 
-Requires [Zig 0.15.2](https://ziglang.org/download/).
+Requires [Zig 0.16.0](https://ziglang.org/download/).
 
 ```bash
 # Development build
@@ -116,4 +116,3 @@ All unit tests cover XML parsing, JSON-RPC dispatch, argument extraction, URL co
 MIT — see [LICENSE](LICENSE).
 
 <!-- mcp-name: io.github.vernonstinebaker/webdav-mcp -->
-
